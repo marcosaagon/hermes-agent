@@ -71,30 +71,20 @@ class TestForceFullRedraw:
             "invalidate",
         ]
 
-    def test_resize_clears_viewport_and_replays(self, bare_cli, monkeypatch):
-        """Resize recovery clears viewport, replays history, restores chrome.
+    def test_resize_clears_viewport_without_replay(self, bare_cli, monkeypatch):
+        """Resize recovery clears viewport and redraws chrome only.
 
-        Goes through the same code path as ``_force_full_redraw`` (Ctrl+L
-        / ``/redraw``): ``\\x1b[2J`` + cursor home wipes the visible
-        viewport, ``_replay_output_history`` repaints banner + chat, and
-        ``app.invalidate`` schedules pt's own redraw of the chrome.
+        We intentionally do NOT replay history on resize because replaying
+        while preserving scrollback duplicates intro/chat on every resize
+        (user-reported).  We also avoid ``\\x1b[3J`` because that wipes
+        the user's pre-Hermes terminal history.
 
-        Earlier iterations (#25975, #24403, #25972, #25974, plus this
-        PR's first commits) tried various "preserve screen + suppress
-        chrome" / "clear viewport + write_raw replay" / "clear viewport
-        + scrollback" combinations.  All had problems: leaving reflowed
-        chrome on screen, white-on-white text from bypassing pt's
-        attribute state, missing input bar from leftover suppression
-        flag, or destroying the user's pre-hermes terminal scrollback.
-
-        Must NOT:
-
-        - call ``original_on_resize`` — its ``renderer.erase`` cursor_ups
-          by stale logical height, leaking reflow extras (original bug)
-        - write ``\\x1b[3J`` (erase scrollback) — destructive to the
-          user's terminal history above the hermes session
-        - leave ``_status_bar_suppressed_after_resize`` True — that
-          hides the input bar / status bar after recovery
+        Contract:
+        - clear viewport (\x1b[2J) + cursor home
+        - no history replay
+        - no original_on_resize call
+        - suppression flag cleared so input/status bar reappear
+        - invalidate scheduled to redraw prompt chrome at new dimensions
         """
         app = MagicMock()
         events: list = []
@@ -106,7 +96,8 @@ class TestForceFullRedraw:
         out.flush.side_effect = lambda: events.append("flush")
         app.renderer.reset.side_effect = lambda **_: events.append("renderer_reset")
         app.invalidate.side_effect = lambda: events.append("invalidate")
-        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
+        replay_called = []
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: replay_called.append(True))
 
         original_called = []
         original_on_resize = lambda: original_called.append(True)
@@ -114,22 +105,18 @@ class TestForceFullRedraw:
         bare_cli._status_bar_suppressed_after_resize = True
         bare_cli._recover_after_resize(app, original_on_resize)
 
-        # Viewport clear + home + replay + invalidate.
         assert "erase_screen" in events, events
         assert "home" in events, events
-        assert "replay" in events, events
         assert events[-1] == "invalidate", events
-        # Must NOT erase scrollback (\x1b[3J) — that would wipe the
-        # user's pre-hermes terminal output.
+        assert replay_called == [], "resize recovery must not replay history"
+        # Must NOT erase scrollback (\x1b[3J)
         write_raws = [
             payload
             for kind, payload in (e for e in events if isinstance(e, tuple) and e[0] == "write_raw")
         ]
         for payload in write_raws:
             assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
-        # original_on_resize is intentionally NOT called.
         assert original_called == [], "original_on_resize must not be invoked"
-        # Suppression must be cleared so input bar / status bar reappear.
         assert bare_cli._status_bar_suppressed_after_resize is False
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):

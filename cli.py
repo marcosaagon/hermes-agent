@@ -2714,64 +2714,35 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Recover a resized classic CLI by repainting the visible viewport.
+        """Recover resize drift without duplicating prior output.
 
-        Resize goes through the same path as ``_force_full_redraw``
-        (Ctrl+L / ``/redraw``): ``\\x1b[2J`` + cursor home clears the
-        viewport, then ``_replay_output_history`` repaints banner + chat
-        above the live prompt.  ``app.invalidate()`` schedules pt's own
-        redraw of the chrome.
+        Terminal emulators reflow already-rendered full-width rows when
+        columns change. prompt_toolkit's native ``_on_resize`` erases by
+        stale logical height, so reflow extras remain visible (the
+        duplicated input/status bars bug).
 
-        Why not also ``\\x1b[3J`` (erase scrollback) — claude-code's Ink
-        renderer does this on resize, but Hermes runs alongside the
-        user's existing terminal session, NOT in alt-screen mode.
-        Erasing scrollback would wipe everything the user had above the
-        hermes session (prior commands, build output, etc.) which is far
-        more destructive than the duplicated-input-bar bug it was
-        trying to fix.
+        We fix this by clearing ONLY the visible viewport
+        (``\x1b[2J\x1b[H`` via ``_clear_prompt_toolkit_screen``) and then
+        invalidating so prompt_toolkit repaints live chrome at the new
+        dimensions.
 
-        The viewport-only clear works because the duplicated-input-bar
-        reports trace to *visible* reflow extras, not scrollback
-        accumulation.  When the terminal column count shrinks, the
-        emulator reflows already-printed full-width rows (status bar,
-        input rules) into multiple narrower rows on screen.  pt's
-        renderer tracks ``_cursor_pos.y`` from the last logical layout —
-        not from the post-reflow physical cursor position — so its own
-        ``erase()`` (cursor_up(y) + erase_down) misses the extras
-        created by reflow.  ``\\x1b[2J`` wipes every visible cell, so
-        the next ``_replay_output_history`` + invalidate paints a clean
-        frame.  Anything that scrolled into true scrollback before the
-        resize is preserved.
+        Intentionally *no history replay* here:
+        - Replaying while preserving scrollback duplicates the intro and
+          chat every resize (user-reported).
+        - Erasing scrollback (``\x1b[3J``) avoids duplicates but destroys
+          the user's pre-Hermes terminal history.
 
-        ``_status_bar_suppressed_after_resize`` is cleared (not set):
-        the previous strategy hid the chrome until the next keystroke,
-        which made the input bar disappear after every resize.  With a
-        clean redraw the chrome must come back immediately.
-
-        ``original_on_resize`` is intentionally unused: pt's
-        ``_on_resize`` calls ``renderer.erase`` which is cursor_up by
-        stale logical height — the very bug we're working around.  The
-        next render after ``app.invalidate()`` reads
-        ``output.get_size()`` fresh and re-lays-out against the
-        current dimensions.
+        This gives idempotent resize behavior in normal non-alt-screen
+        terminals: clean prompt/input bar after each resize, no repeated
+        intro spam, no scrollback wipe.
         """
-        del original_on_resize  # see docstring
+        del original_on_resize  # intentionally unused
         try:
-            # \x1b[2J + cursor home + renderer.reset.  No \x1b[3J: that
-            # would wipe the user's pre-hermes terminal scrollback.
             self._clear_prompt_toolkit_screen(app)
         except Exception:
             pass
-        # Chrome must reappear after recovery; the suppression flag's
-        # previous "hide until next input" semantics is what made the
-        # input bar disappear entirely after resize.
+        # Ensure chrome is visible immediately after recovery.
         self._status_bar_suppressed_after_resize = False
-        try:
-            # Replay via _pt_print — attribute-safe (matches pt's
-            # renderer state), unlike a hand-rolled write_raw.
-            _replay_output_history()
-        except Exception:
-            pass
         try:
             app.invalidate()
         except Exception:
