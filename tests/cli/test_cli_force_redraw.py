@@ -108,7 +108,6 @@ class TestForceFullRedraw:
 
         assert "erase_screen" in events, events
         assert "home" in events, events
-        assert events[-1] == "invalidate", events
         assert replay_called == [], "resize recovery must not replay history"
         # Must NOT erase scrollback (\x1b[3J)
         write_raws = [
@@ -118,8 +117,9 @@ class TestForceFullRedraw:
         for payload in write_raws:
             assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
         assert original_called == [True], "original_on_resize should be invoked once after clear"
-        # Ensure on_resize runs after the clear primitive, not before.
-        assert events.index("erase_screen") < events.index("invalidate"), events
+        # Successful original_on_resize() already redraws; avoid a second
+        # invalidate pass that can stamp duplicate footer snapshots.
+        assert "invalidate" not in events, events
         assert bare_cli._status_bar_suppressed_after_resize is False
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
