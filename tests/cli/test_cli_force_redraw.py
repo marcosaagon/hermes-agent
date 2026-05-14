@@ -82,10 +82,11 @@ class TestForceFullRedraw:
         Contract:
         - clear viewport (\x1b[2J) + cursor home
         - no history replay
-        - call original_on_resize AFTER clear so prompt_toolkit re-anchors
-          cursor/layout at the new size from a clean (0,0) baseline
+        - call prompt_toolkit re-anchor path AFTER clear using
+          _request_absolute_cursor_position() + _redraw() (without
+          renderer.erase())
         - suppression flag cleared so input/status bar reappear
-        - invalidate scheduled to redraw prompt chrome at new dimensions
+        - fallback invalidate only if re-anchor/redraw path fails
         """
         app = MagicMock()
         events: list = []
@@ -100,8 +101,10 @@ class TestForceFullRedraw:
         replay_called = []
         monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: replay_called.append(True))
 
-        original_called = []
-        original_on_resize = lambda: original_called.append(True)
+        reanchor_calls = []
+        app._request_absolute_cursor_position.side_effect = lambda: reanchor_calls.append("cpr")
+        app._redraw.side_effect = lambda: reanchor_calls.append("redraw")
+        original_on_resize = lambda: reanchor_calls.append("legacy_on_resize")
 
         bare_cli._status_bar_suppressed_after_resize = True
         bare_cli._recover_after_resize(app, original_on_resize)
@@ -116,9 +119,8 @@ class TestForceFullRedraw:
         ]
         for payload in write_raws:
             assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
-        assert original_called == [True], "original_on_resize should be invoked once after clear"
-        # Successful original_on_resize() already redraws; avoid a second
-        # invalidate pass that can stamp duplicate footer snapshots.
+        assert reanchor_calls == ["cpr", "redraw"], f"expected CPR+redraw path: {reanchor_calls!r}"
+        # Fallback invalidate should not run when re-anchor path succeeds.
         assert "invalidate" not in events, events
         assert bare_cli._status_bar_suppressed_after_resize is False
 

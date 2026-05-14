@@ -2744,14 +2744,17 @@ class HermesCLI:
         # Ensure chrome is visible immediately after recovery.
         self._status_bar_suppressed_after_resize = False
         try:
-            # After renderer.reset(), prompt_toolkit must re-anchor cursor
-            # via its normal resize path (CPR + redraw). Calling the original
-            # handler *after* the clear is safe: _cursor_pos is now (0,0), so
-            # erase() cannot leak stale reflow rows into scrollback.
-            # NOTE: original_on_resize already triggers a redraw; avoid a
-            # second invalidate here (that extra pass can stamp duplicate
-            # footer/input snapshots into scrollback on some terminals).
-            original_on_resize()
+            # Re-anchor prompt_toolkit to the terminal after the hard clear
+            # without running renderer.erase() again. `_on_resize`'s erase
+            # path is what leaks duplicate footer snapshots under reflow.
+            req = getattr(app, "_request_absolute_cursor_position", None)
+            redraw = getattr(app, "_redraw", None)
+            if callable(req):
+                req()
+            if callable(redraw):
+                redraw()
+            else:
+                app.invalidate()
         except Exception:
             try:
                 app.invalidate()
