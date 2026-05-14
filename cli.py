@@ -2714,91 +2714,61 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Recover a resized classic CLI by clearing and replaying scrollback.
+        """Recover a resized classic CLI by clearing scrollback and repainting.
 
-        Why a full clear-and-replay: when the terminal column count changes,
-        the emulator reflows already-printed full-width rows (status bar,
-        input rules, banner) into multiple narrower rows.  prompt_toolkit's
-        renderer tracks ``_cursor_pos.y`` from the last logical layout —
-        not from the post-reflow physical cursor position — so its own
-        ``erase()`` (cursor_up(y) + erase_down) misses the extras created by
-        reflow.  The leftover rows are what users see as a "duplicated input
-        bar" after every resize (#19280, #22976).
+        Replicates claude-code's Ink-renderer resize strategy: on SIGWINCH
+        write ``\\x1b[2J\\x1b[3J\\x1b[H`` (erase viewport + erase scrollback
+        + cursor home), then re-render the frame from a known source of
+        truth.  Without erasing scrollback, every resize pushes the
+        previous render's reflowed chrome upward — repeated resizes
+        accumulate duplicated banners + input bars, which is what users
+        see.
 
-        Trying to compute the exact drift is fragile and emulator-specific
-        (#17691 / #19280 / #25975 attempted this and missed cases).
-        Instead we do what claude-code's Ink-based renderer does on resize:
-        clear the physical screen + cursor-home + repaint tracked scrollback
-        (banner + recent chat output).  Native ``erase_screen``/``\\x1b[2J``
-        clears the viewport but leaves true scrollback intact, so the user
-        keeps their session history; the replay just rebuilds what's
-        currently *visible*.
+        Earlier salvage iterations (#19280, #24403/#25975, #25972, #25974,
+        plus this PR's first commits) tried various combinations of
+        "preserve screen + suppress chrome" or "clear viewport only +
+        replay async".  All of them either left reflowed bars on screen
+        or stacked replays into the viewport.  Clearing scrollback is the
+        only reliable way to make resize idempotent.
 
-        Order matters here:
+        ``_OUTPUT_HISTORY`` preserves recent CLI output (banner +
+        responses); ``_replay_output_history`` writes it through
+        ``_pt_print``, which is cursor-and-attribute aware (it goes
+        through prompt_toolkit's own renderer, so terminal attributes
+        stay consistent with what pt's diff renderer expects on the next
+        frame — write_raw bypasses this and produces white-on-white
+        artifacts).
 
-        1. ``_clear_prompt_toolkit_screen`` writes ``\\x1b[2J`` + home and
-           resets the renderer's diff cache (``_cursor_pos`` → (0,0),
-           ``_last_screen`` → None) so the next paint writes every cell
-           from a known origin.  ``_min_available_height = 0`` makes
-           prompt_toolkit re-send a CPR on the next render to re-anchor.
-        2. Write the recorded history directly to the output via
-           ``write_raw`` — synchronously, NOT through ``_pt_print``.  The
-           latter schedules ``run_in_terminal`` on the event loop, which
-           means a second resize landing before the queued replay fires
-           can stack two history copies into the viewport.  Bypassing the
-           queue keeps each resize a single atomic clear + repaint.
-        3. ``app.invalidate()`` to schedule prompt_toolkit's own redraw of
-           the live chrome below the replayed scrollback.  On the next
-           render prompt_toolkit's renderer reads ``output.get_size()``
-           fresh, so we don't need to call the original ``_on_resize``
-           (which is what was leaking reflowed chrome in the first place).
+        ``_status_bar_suppressed_after_resize`` is intentionally cleared
+        here.  Suppression was useful when we were trying to avoid
+        repainting chrome at all; now that we're doing a clean redraw,
+        the chrome must come back immediately so the user sees their
+        input bar after the resize completes.
 
-        ``original_on_resize`` is intentionally unused — kept in the
-        signature for API compatibility with ``_schedule_resize_recovery``
-        callers and existing tests.
-
-        We also flag ``_status_bar_suppressed_after_resize`` so the dynamic
-        status bar and input separator rules stay hidden until the next
-        user input.  If a second resize lands while we're mid-redraw,
-        suppressing chrome shrinks the surface area that can re-reflow.
+        ``original_on_resize`` is intentionally unused: prompt_toolkit's
+        ``_on_resize`` calls ``renderer.erase`` which is cursor_up by
+        stale logical height — the very bug we're working around.
+        ``app.invalidate()`` is enough; the next render reads
+        ``output.get_size()`` fresh.
         """
-        del original_on_resize  # intentionally unused; see docstring
-        self._status_bar_suppressed_after_resize = True
+        del original_on_resize  # see docstring
         try:
-            self._clear_prompt_toolkit_screen(app)
+            # Erase viewport + scrollback + home cursor + reset pt's diff cache.
+            # rebuild_scrollback=True writes \x1b[3J so the previous resize's
+            # output cannot stay above the viewport across multiple resizes.
+            self._clear_prompt_toolkit_screen(app, rebuild_scrollback=True)
         except Exception:
             pass
-        # Synchronously write the tracked scrollback to the terminal so
-        # the banner + recent chat reappear above the prompt.  Inlining
-        # this (instead of going through _pt_print) avoids the
-        # async/run_in_terminal scheduling that lets concurrent resizes
-        # double-replay into the viewport.
+        # Clear suppression BEFORE replay so the next invalidate paints the
+        # status bar + input rules normally.  Past iterations left this True
+        # to "hide chrome until next input" — which is what made the input
+        # bar disappear entirely after resize.
+        self._status_bar_suppressed_after_resize = False
         try:
-            out = app.renderer.output
-            rendered: list[str] = []
-            for entry in tuple(_OUTPUT_HISTORY):
-                if callable(entry):
-                    try:
-                        result = entry()
-                    except Exception:
-                        continue
-                    if isinstance(result, str):
-                        rendered.extend(result.splitlines())
-                    else:
-                        try:
-                            rendered.extend(str(line) for line in result)
-                        except Exception:
-                            continue
-                else:
-                    rendered.append(str(entry))
-            if rendered:
-                # Each entry is one logical row — prompt_toolkit's print
-                # path uses \r\n on telnet-style frontends but raw \n is
-                # correct for vt100.  Trailing \n leaves the cursor on a
-                # blank row below the history so the next render's chrome
-                # doesn't overwrite the last replayed line.
-                out.write_raw("\n".join(rendered) + "\n")
-                out.flush()
+            # Replay banner + recent chat above the prompt.  _pt_print is
+            # cursor-position-aware and attribute-safe (it uses pt's own
+            # output pipeline rather than write_raw bypassing it).
+            _replay_output_history()
         except Exception:
             pass
         try:

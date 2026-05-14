@@ -71,84 +71,71 @@ class TestForceFullRedraw:
             "invalidate",
         ]
 
-    def test_resize_clears_and_replays_scrollback(self, bare_cli, monkeypatch):
-        """Resize recovery clears the physical screen and replays scrollback.
+    def test_resize_clears_scrollback_and_replays(self, bare_cli, monkeypatch):
+        """Resize recovery clears viewport+scrollback and replays history.
 
-        Earlier iterations (#25975, #24403, #25972, #25974) tried to keep
-        the screen untouched on SIGWINCH and just suppress new chrome
-        until the next prompt.  That approach left already-reflowed input
-        bars visible above the new chrome — the "duplicated input bar"
-        report — because prompt_toolkit's ``renderer.erase`` only
-        cursor_up()s by the stored logical layout height, not by the
-        physical extras created when the terminal emulator reflowed
-        full-width rows.
+        Earlier iterations (#25975, #24403, #25972, #25974, and the first
+        commits on this branch) tried various "preserve screen + suppress
+        chrome" or "clear viewport only + sync write_raw" combinations.
+        All of them either left reflowed bars on screen or stacked
+        content across repeated resizes because ``\\x1b[2J`` clears the
+        viewport but leaves scrollback intact — so the previous resize's
+        already-reflowed chrome stays above the visible region.
 
         The current approach mirrors what claude-code's Ink renderer does:
-        clear the viewport (``\\x1b[2J`` leaves true scrollback intact),
-        then directly write the recorded history above the live prompt so
-        the banner + recent chat are reconstructed cleanly.  The history
-        is written *synchronously* via ``output.write_raw`` rather than
-        ``_pt_print`` — the latter schedules via ``run_in_terminal``,
-        which lets concurrent resizes stack double-replays into the
-        viewport.
+        write ``\\x1b[2J\\x1b[3J\\x1b[H`` (viewport + scrollback + home) and
+        then replay tracked history through prompt_toolkit's own output
+        pipeline (``_pt_print`` via ``_replay_output_history``).  This
+        keeps colors/attributes consistent with pt's renderer state on
+        the next frame; ``write_raw`` of recorded ANSI bypasses that
+        state and produces white-on-white artifacts.
 
-        Note: ``original_on_resize`` is intentionally NOT called.  Its
-        ``renderer.erase`` (cursor_up(stale_y) + erase_down) is what was
-        leaking reflowed chrome in the first place.  ``app.invalidate()``
-        is sufficient to trigger prompt_toolkit's own re-layout on the
-        next render cycle (it reads the current terminal size fresh).
+        ``_status_bar_suppressed_after_resize`` must be False after
+        recovery so the next invalidate paints the input bar / status bar
+        normally.  Leaving it True (the previous strategy) made the input
+        bar disappear entirely.
 
-        ``_status_bar_suppressed_after_resize`` is set so subsequent
-        resizes landing mid-redraw don't re-reflow chrome.
+        ``original_on_resize`` must NOT be invoked: its ``renderer.erase``
+        does ``cursor_up(stale_logical_y) + erase_down`` which is the
+        original duplication source.
         """
-        from cli import _OUTPUT_HISTORY
-
         app = MagicMock()
         events: list = []
         out = app.renderer.output
-        out.erase_screen.side_effect = lambda: events.append("erase")
-        out.cursor_goto.side_effect = lambda *_: events.append("home")
-        out.flush.side_effect = lambda: events.append(("flush",))
+        out.reset_attributes.side_effect = lambda: events.append("reset_attrs")
+        out.erase_screen.side_effect = lambda: events.append("erase_screen")
         out.write_raw.side_effect = lambda s: events.append(("write_raw", s))
+        out.cursor_goto.side_effect = lambda *_: events.append("home")
+        out.flush.side_effect = lambda: events.append("flush")
         app.renderer.reset.side_effect = lambda **_: events.append("renderer_reset")
         app.invalidate.side_effect = lambda: events.append("invalidate")
+        monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: events.append("replay"))
 
         original_called = []
         original_on_resize = lambda: original_called.append(True)
 
-        # Seed a known history entry so the replay step has something to write.
-        _OUTPUT_HISTORY.clear()
-        _OUTPUT_HISTORY.append("Welcome to Hermes Agent!")
-        _OUTPUT_HISTORY.append(lambda: "banner line A\nbanner line B")
+        # Set suppression True so we can verify recovery clears it.
+        bare_cli._status_bar_suppressed_after_resize = True
+        bare_cli._recover_after_resize(app, original_on_resize)
 
-        try:
-            bare_cli._status_bar_suppressed_after_resize = False
-            bare_cli._recover_after_resize(app, original_on_resize)
-
-            # Contract:
-            # - erase_screen + cursor home (viewport clear, scrollback intact)
-            # - synchronous write_raw with the recorded history
-            # - invalidate to schedule prompt_toolkit's own redraw
-            assert "erase" in events, events
-            assert "home" in events, events
-            assert any(
-                kind == "write_raw" and "Welcome to Hermes Agent!" in payload
-                for kind, payload in (e for e in events if isinstance(e, tuple) and e[0] == "write_raw")
-            ), events
-            assert any(
-                kind == "write_raw" and "banner line A" in payload and "banner line B" in payload
-                for kind, payload in (e for e in events if isinstance(e, tuple) and e[0] == "write_raw")
-            ), events
-            # invalidate must be the last call so the next render reflects
-            # the new dimensions.
-            assert events[-1] == "invalidate", events
-            # original_on_resize is intentionally NOT called — its
-            # cursor_up(stale_y) is what was leaking reflowed chrome.
-            assert original_called == [], "original_on_resize must not be invoked"
-            # Status bar / input rules must be suppressed until the next prompt.
-            assert bare_cli._status_bar_suppressed_after_resize is True
-        finally:
-            _OUTPUT_HISTORY.clear()
+        # Must erase BOTH the viewport (\x1b[2J via erase_screen) AND
+        # scrollback (\x1b[3J via write_raw).  Without the scrollback
+        # erase, repeated resizes stack content above the viewport.
+        assert "erase_screen" in events, events
+        assert any(
+            isinstance(e, tuple) and e[0] == "write_raw" and "\x1b[3J" in e[1]
+            for e in events
+        ), f"Expected \\x1b[3J in write_raw payload: {events}"
+        assert "home" in events, events
+        # Replay must run (banner + chat repainted above prompt).
+        assert "replay" in events, events
+        # Invalidate must be last so pt's next render reflects new dims.
+        assert events[-1] == "invalidate", events
+        # original_on_resize is intentionally NOT called — its erase()
+        # is what was leaking reflowed chrome.
+        assert original_called == [], "original_on_resize must not be invoked"
+        # Suppression must be cleared so input bar / status bar reappear.
+        assert bare_cli._status_bar_suppressed_after_resize is False
 
     def test_force_redraw_uses_full_screen_clear_without_scrollback_clear(self, bare_cli):
         app = MagicMock()
