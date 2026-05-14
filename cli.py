@@ -2736,25 +2736,22 @@ class HermesCLI:
         terminals: clean prompt/input bar after each resize, no repeated
         intro spam, no scrollback wipe.
         """
+        # Don't hard-clear the viewport on every SIGWINCH: in non-alt-screen
+        # mode that can stamp large filler whitespace snapshots into scrollback
+        # (visible when users scroll up/down after resizing).
+        #
+        # Instead, reset prompt_toolkit's cached renderer state and then let
+        # its native resize path recompute layout + redraw in-place.
         try:
-            # First, wipe visible viewport + reset renderer state.
-            self._clear_prompt_toolkit_screen(app)
+            app.renderer.reset(leave_alternate_screen=False)
         except Exception:
             pass
-        # Ensure chrome is visible immediately after recovery.
+
+        # Keep chrome visible after resize.
         self._status_bar_suppressed_after_resize = False
+
         try:
-            # Re-anchor prompt_toolkit to the terminal after the hard clear
-            # without running renderer.erase() again. `_on_resize`'s erase
-            # path is what leaks duplicate footer snapshots under reflow.
-            req = getattr(app, "_request_absolute_cursor_position", None)
-            redraw = getattr(app, "_redraw", None)
-            if callable(req):
-                req()
-            if callable(redraw):
-                redraw()
-            else:
-                app.invalidate()
+            original_on_resize()
         except Exception:
             try:
                 app.invalidate()

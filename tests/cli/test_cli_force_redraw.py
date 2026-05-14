@@ -80,13 +80,11 @@ class TestForceFullRedraw:
         the user's pre-Hermes terminal history.
 
         Contract:
-        - clear viewport (\x1b[2J) + cursor home
+        - reset prompt_toolkit renderer cache (no hard viewport clear)
         - no history replay
-        - call prompt_toolkit re-anchor path AFTER clear using
-          _request_absolute_cursor_position() + _redraw() (without
-          renderer.erase())
+        - run original_on_resize() once so pt recomputes layout/CPR
         - suppression flag cleared so input/status bar reappear
-        - fallback invalidate only if re-anchor/redraw path fails
+        - fallback invalidate only if original_on_resize fails
         """
         app = MagicMock()
         events: list = []
@@ -101,16 +99,15 @@ class TestForceFullRedraw:
         replay_called = []
         monkeypatch.setattr(cli_mod, "_replay_output_history", lambda: replay_called.append(True))
 
-        reanchor_calls = []
-        app._request_absolute_cursor_position.side_effect = lambda: reanchor_calls.append("cpr")
-        app._redraw.side_effect = lambda: reanchor_calls.append("redraw")
-        original_on_resize = lambda: reanchor_calls.append("legacy_on_resize")
+        on_resize_calls = []
+        original_on_resize = lambda: on_resize_calls.append("legacy_on_resize")
 
         bare_cli._status_bar_suppressed_after_resize = True
         bare_cli._recover_after_resize(app, original_on_resize)
 
-        assert "erase_screen" in events, events
-        assert "home" in events, events
+        # No hard clear path calls.
+        assert "erase_screen" not in events, events
+        assert "home" not in events, events
         assert replay_called == [], "resize recovery must not replay history"
         # Must NOT erase scrollback (\x1b[3J)
         write_raws = [
@@ -119,8 +116,10 @@ class TestForceFullRedraw:
         ]
         for payload in write_raws:
             assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
-        assert reanchor_calls == ["cpr", "redraw"], f"expected CPR+redraw path: {reanchor_calls!r}"
-        # Fallback invalidate should not run when re-anchor path succeeds.
+        # renderer reset + native resize pass
+        assert "renderer_reset" in events, events
+        assert on_resize_calls == ["legacy_on_resize"], f"expected one native resize call: {on_resize_calls!r}"
+        # Fallback invalidate should not run when native resize succeeds.
         assert "invalidate" not in events, events
         assert bare_cli._status_bar_suppressed_after_resize is False
 
