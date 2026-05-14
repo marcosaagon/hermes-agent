@@ -71,33 +71,30 @@ class TestForceFullRedraw:
             "invalidate",
         ]
 
-    def test_resize_clears_scrollback_and_replays(self, bare_cli, monkeypatch):
-        """Resize recovery clears viewport+scrollback and replays history.
+    def test_resize_clears_viewport_and_replays(self, bare_cli, monkeypatch):
+        """Resize recovery clears viewport, replays history, restores chrome.
 
-        Earlier iterations (#25975, #24403, #25972, #25974, and the first
-        commits on this branch) tried various "preserve screen + suppress
-        chrome" or "clear viewport only + sync write_raw" combinations.
-        All of them either left reflowed bars on screen or stacked
-        content across repeated resizes because ``\\x1b[2J`` clears the
-        viewport but leaves scrollback intact — so the previous resize's
-        already-reflowed chrome stays above the visible region.
+        Goes through the same code path as ``_force_full_redraw`` (Ctrl+L
+        / ``/redraw``): ``\\x1b[2J`` + cursor home wipes the visible
+        viewport, ``_replay_output_history`` repaints banner + chat, and
+        ``app.invalidate`` schedules pt's own redraw of the chrome.
 
-        The current approach mirrors what claude-code's Ink renderer does:
-        write ``\\x1b[2J\\x1b[3J\\x1b[H`` (viewport + scrollback + home) and
-        then replay tracked history through prompt_toolkit's own output
-        pipeline (``_pt_print`` via ``_replay_output_history``).  This
-        keeps colors/attributes consistent with pt's renderer state on
-        the next frame; ``write_raw`` of recorded ANSI bypasses that
-        state and produces white-on-white artifacts.
+        Earlier iterations (#25975, #24403, #25972, #25974, plus this
+        PR's first commits) tried various "preserve screen + suppress
+        chrome" / "clear viewport + write_raw replay" / "clear viewport
+        + scrollback" combinations.  All had problems: leaving reflowed
+        chrome on screen, white-on-white text from bypassing pt's
+        attribute state, missing input bar from leftover suppression
+        flag, or destroying the user's pre-hermes terminal scrollback.
 
-        ``_status_bar_suppressed_after_resize`` must be False after
-        recovery so the next invalidate paints the input bar / status bar
-        normally.  Leaving it True (the previous strategy) made the input
-        bar disappear entirely.
+        Must NOT:
 
-        ``original_on_resize`` must NOT be invoked: its ``renderer.erase``
-        does ``cursor_up(stale_logical_y) + erase_down`` which is the
-        original duplication source.
+        - call ``original_on_resize`` — its ``renderer.erase`` cursor_ups
+          by stale logical height, leaking reflow extras (original bug)
+        - write ``\\x1b[3J`` (erase scrollback) — destructive to the
+          user's terminal history above the hermes session
+        - leave ``_status_bar_suppressed_after_resize`` True — that
+          hides the input bar / status bar after recovery
         """
         app = MagicMock()
         events: list = []
@@ -114,25 +111,23 @@ class TestForceFullRedraw:
         original_called = []
         original_on_resize = lambda: original_called.append(True)
 
-        # Set suppression True so we can verify recovery clears it.
         bare_cli._status_bar_suppressed_after_resize = True
         bare_cli._recover_after_resize(app, original_on_resize)
 
-        # Must erase BOTH the viewport (\x1b[2J via erase_screen) AND
-        # scrollback (\x1b[3J via write_raw).  Without the scrollback
-        # erase, repeated resizes stack content above the viewport.
+        # Viewport clear + home + replay + invalidate.
         assert "erase_screen" in events, events
-        assert any(
-            isinstance(e, tuple) and e[0] == "write_raw" and "\x1b[3J" in e[1]
-            for e in events
-        ), f"Expected \\x1b[3J in write_raw payload: {events}"
         assert "home" in events, events
-        # Replay must run (banner + chat repainted above prompt).
         assert "replay" in events, events
-        # Invalidate must be last so pt's next render reflects new dims.
         assert events[-1] == "invalidate", events
-        # original_on_resize is intentionally NOT called — its erase()
-        # is what was leaking reflowed chrome.
+        # Must NOT erase scrollback (\x1b[3J) — that would wipe the
+        # user's pre-hermes terminal output.
+        write_raws = [
+            payload
+            for kind, payload in (e for e in events if isinstance(e, tuple) and e[0] == "write_raw")
+        ]
+        for payload in write_raws:
+            assert "\x1b[3J" not in payload, f"resize must NOT erase scrollback: {payload!r}"
+        # original_on_resize is intentionally NOT called.
         assert original_called == [], "original_on_resize must not be invoked"
         # Suppression must be cleared so input bar / status bar reappear.
         assert bare_cli._status_bar_suppressed_after_resize is False

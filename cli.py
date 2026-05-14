@@ -2714,60 +2714,61 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Recover a resized classic CLI by clearing scrollback and repainting.
+        """Recover a resized classic CLI by repainting the visible viewport.
 
-        Replicates claude-code's Ink-renderer resize strategy: on SIGWINCH
-        write ``\\x1b[2J\\x1b[3J\\x1b[H`` (erase viewport + erase scrollback
-        + cursor home), then re-render the frame from a known source of
-        truth.  Without erasing scrollback, every resize pushes the
-        previous render's reflowed chrome upward — repeated resizes
-        accumulate duplicated banners + input bars, which is what users
-        see.
+        Resize goes through the same path as ``_force_full_redraw``
+        (Ctrl+L / ``/redraw``): ``\\x1b[2J`` + cursor home clears the
+        viewport, then ``_replay_output_history`` repaints banner + chat
+        above the live prompt.  ``app.invalidate()`` schedules pt's own
+        redraw of the chrome.
 
-        Earlier salvage iterations (#19280, #24403/#25975, #25972, #25974,
-        plus this PR's first commits) tried various combinations of
-        "preserve screen + suppress chrome" or "clear viewport only +
-        replay async".  All of them either left reflowed bars on screen
-        or stacked replays into the viewport.  Clearing scrollback is the
-        only reliable way to make resize idempotent.
+        Why not also ``\\x1b[3J`` (erase scrollback) — claude-code's Ink
+        renderer does this on resize, but Hermes runs alongside the
+        user's existing terminal session, NOT in alt-screen mode.
+        Erasing scrollback would wipe everything the user had above the
+        hermes session (prior commands, build output, etc.) which is far
+        more destructive than the duplicated-input-bar bug it was
+        trying to fix.
 
-        ``_OUTPUT_HISTORY`` preserves recent CLI output (banner +
-        responses); ``_replay_output_history`` writes it through
-        ``_pt_print``, which is cursor-and-attribute aware (it goes
-        through prompt_toolkit's own renderer, so terminal attributes
-        stay consistent with what pt's diff renderer expects on the next
-        frame — write_raw bypasses this and produces white-on-white
-        artifacts).
+        The viewport-only clear works because the duplicated-input-bar
+        reports trace to *visible* reflow extras, not scrollback
+        accumulation.  When the terminal column count shrinks, the
+        emulator reflows already-printed full-width rows (status bar,
+        input rules) into multiple narrower rows on screen.  pt's
+        renderer tracks ``_cursor_pos.y`` from the last logical layout —
+        not from the post-reflow physical cursor position — so its own
+        ``erase()`` (cursor_up(y) + erase_down) misses the extras
+        created by reflow.  ``\\x1b[2J`` wipes every visible cell, so
+        the next ``_replay_output_history`` + invalidate paints a clean
+        frame.  Anything that scrolled into true scrollback before the
+        resize is preserved.
 
-        ``_status_bar_suppressed_after_resize`` is intentionally cleared
-        here.  Suppression was useful when we were trying to avoid
-        repainting chrome at all; now that we're doing a clean redraw,
-        the chrome must come back immediately so the user sees their
-        input bar after the resize completes.
+        ``_status_bar_suppressed_after_resize`` is cleared (not set):
+        the previous strategy hid the chrome until the next keystroke,
+        which made the input bar disappear after every resize.  With a
+        clean redraw the chrome must come back immediately.
 
-        ``original_on_resize`` is intentionally unused: prompt_toolkit's
+        ``original_on_resize`` is intentionally unused: pt's
         ``_on_resize`` calls ``renderer.erase`` which is cursor_up by
-        stale logical height — the very bug we're working around.
-        ``app.invalidate()`` is enough; the next render reads
-        ``output.get_size()`` fresh.
+        stale logical height — the very bug we're working around.  The
+        next render after ``app.invalidate()`` reads
+        ``output.get_size()`` fresh and re-lays-out against the
+        current dimensions.
         """
         del original_on_resize  # see docstring
         try:
-            # Erase viewport + scrollback + home cursor + reset pt's diff cache.
-            # rebuild_scrollback=True writes \x1b[3J so the previous resize's
-            # output cannot stay above the viewport across multiple resizes.
-            self._clear_prompt_toolkit_screen(app, rebuild_scrollback=True)
+            # \x1b[2J + cursor home + renderer.reset.  No \x1b[3J: that
+            # would wipe the user's pre-hermes terminal scrollback.
+            self._clear_prompt_toolkit_screen(app)
         except Exception:
             pass
-        # Clear suppression BEFORE replay so the next invalidate paints the
-        # status bar + input rules normally.  Past iterations left this True
-        # to "hide chrome until next input" — which is what made the input
-        # bar disappear entirely after resize.
+        # Chrome must reappear after recovery; the suppression flag's
+        # previous "hide until next input" semantics is what made the
+        # input bar disappear entirely after resize.
         self._status_bar_suppressed_after_resize = False
         try:
-            # Replay banner + recent chat above the prompt.  _pt_print is
-            # cursor-position-aware and attribute-safe (it uses pt's own
-            # output pipeline rather than write_raw bypassing it).
+            # Replay via _pt_print — attribute-safe (matches pt's
+            # renderer state), unlike a hand-rolled write_raw.
             _replay_output_history()
         except Exception:
             pass
